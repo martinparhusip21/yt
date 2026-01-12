@@ -1,24 +1,19 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from pytubefix import YouTube
+import yt_dlp
 import re
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS untuk dipanggil dari Lovable
+CORS(app)
 
 def is_valid_youtube_url(url):
-    """Validate YouTube URL format"""
-    patterns = [
-        r"^(https?://)?(www\.)?youtube\.com/watch\?v=[\w-]+",
-        r"^(https?://)?(www\.)?youtu\.be/[\w-]+",
-    ]
-    return any(re.match(pattern, url) for pattern in patterns)
+    pattern = r"^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w-]+"
+    return re.match(pattern, url) is not None
 
 def extract_video_id(url):
-    """Extract video ID from YouTube URL"""
     patterns = [
-        r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
-        r"(?:youtu\.be\/)([0-9A-Za-z_-]{11})",
+        r'(?:v=|/)([a-zA-Z0-9_-]{11})(?:[&?]|$)',
+        r'youtu\.be/([a-zA-Z0-9_-]{11})',
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
@@ -26,165 +21,131 @@ def extract_video_id(url):
             return match.group(1)
     return None
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "ok", "service": "youtube-downloader"}), 200
+@app.route('/')
+def home():
+    return jsonify({"status": "ok", "message": "YouTube Download API with yt-dlp"})
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy"})
 
 @app.route('/get_download_url', methods=['POST'])
 def get_download_url():
-    """
-    Get direct download URL for a YouTube video.
-    This is the main endpoint used by Lovable.
-    """
     data = request.get_json()
-    
-    if not data:
-        return jsonify({"error": "No JSON data provided"}), 400
-    
     url = data.get('url')
-    video_id = data.get('videoId')
-    preferred_resolution = data.get('resolution', '720p')
-    
-    # Build YouTube URL if only videoId provided
-    if not url and video_id:
-        url = f"https://www.youtube.com/watch?v={video_id}"
     
     if not url:
-        return jsonify({"error": "Missing 'url' or 'videoId' parameter"}), 400
-
+        return jsonify({"error": "Missing 'url' parameter"}), 400
+    
     if not is_valid_youtube_url(url):
         return jsonify({"error": "Invalid YouTube URL"}), 400
     
     try:
-        yt = YouTube(url)
+        ydl_opts = {
+            'format': 'best[ext=mp4][height<=720]/best[ext=mp4]/best',
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
         
-        # Try to get progressive stream (video + audio combined)
-        # Progressive streams are easier to process
-        stream = None
-        
-        # Try preferred resolution first
-        stream = yt.streams.filter(
-            progressive=True, 
-            file_extension='mp4', 
-            resolution=preferred_resolution
-        ).first()
-        
-        # If not found, try other resolutions in order of preference
-        if not stream:
-            for res in ['720p', '480p', '360p', '240p', '144p']:
-                stream = yt.streams.filter(
-                    progressive=True, 
-                    file_extension='mp4', 
-                    resolution=res
-                ).first()
-                if stream:
-                    break
-        
-        # Last resort: get any progressive MP4 stream
-        if not stream:
-            stream = yt.streams.filter(
-                progressive=True, 
-                file_extension='mp4'
-            ).order_by('resolution').desc().first()
-        
-        if not stream:
-            return jsonify({
-                "error": "No suitable video stream found",
-                "available_streams": [
-                    {"resolution": s.resolution, "type": s.mime_type}
-                    for s in yt.streams.filter(file_extension='mp4')
-                ]
-            }), 404
-        
-        # Return the direct URL
-        return jsonify({
-            "success": True,
-            "download_url": stream.url,
-            "title": yt.title,
-            "author": yt.author,
-            "length": yt.length,
-            "resolution": stream.resolution,
-            "filesize": stream.filesize,
-            "mime_type": stream.mime_type
-        }), 200
-        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            # Get the direct URL
+            video_url = info.get('url')
+            
+            # If no direct URL, try formats
+            if not video_url and info.get('formats'):
+                # Find best mp4 format with video+audio
+                formats = info['formats']
+                
+                # Prefer formats with both video and audio
+                combined = [f for f in formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none' and f.get('ext') == 'mp4']
+                if combined:
+                    # Sort by height, prefer 720p
+                    combined.sort(key=lambda x: abs((x.get('height') or 0) - 720))
+                    video_url = combined[0].get('url')
+                
+                # Fallback to any mp4 with video
+                if not video_url:
+                    mp4_videos = [f for f in formats if f.get('vcodec') != 'none' and f.get('ext') == 'mp4']
+                    if mp4_videos:
+                        mp4_videos.sort(key=lambda x: x.get('height') or 0, reverse=True)
+                        video_url = mp4_videos[0].get('url')
+            
+            if video_url:
+                return jsonify({
+                    "success": True,
+                    "download_url": video_url,
+                    "title": info.get('title'),
+                    "duration": info.get('duration'),
+                    "resolution": info.get('resolution') or info.get('height'),
+                })
+            else:
+                return jsonify({"error": "Could not extract video URL"}), 500
+                
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        # Clean up ANSI codes
+        import re as re2
+        error_msg = re2.sub(r'\x1b\[[0-9;]*m', '', error_msg)
+        return jsonify({"error": f"Download error: {error_msg}", "video_url": url}), 500
     except Exception as e:
-        return jsonify({
-            "error": f"Failed to process video: {str(e)}",
-            "video_url": url
-        }), 500
+        return jsonify({"error": f"Failed to process: {str(e)}", "video_url": url}), 500
 
 @app.route('/video_info', methods=['POST'])
 def video_info():
-    """Get video metadata without download URL"""
     data = request.get_json()
     url = data.get('url')
-    video_id = data.get('videoId')
-    
-    if not url and video_id:
-        url = f"https://www.youtube.com/watch?v={video_id}"
     
     if not url:
-        return jsonify({"error": "Missing 'url' or 'videoId' parameter"}), 400
-
-    if not is_valid_youtube_url(url):
-        return jsonify({"error": "Invalid YouTube URL"}), 400
+        return jsonify({"error": "Missing 'url' parameter"}), 400
     
     try:
-        yt = YouTube(url)
-        
-        return jsonify({
-            "success": True,
-            "title": yt.title,
-            "author": yt.author,
-            "length": yt.length,
-            "views": yt.views,
-            "description": yt.description[:500] if yt.description else None,
-            "thumbnail_url": yt.thumbnail_url,
-            "publish_date": str(yt.publish_date) if yt.publish_date else None,
-        }), 200
-        
+        ydl_opts = {'quiet': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return jsonify({
+                "title": info.get('title'),
+                "author": info.get('uploader'),
+                "length": info.get('duration'),
+                "views": info.get('view_count'),
+                "description": info.get('description'),
+            })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/available_resolutions', methods=['POST'])
-def available_resolutions():
-    """Get available video resolutions"""
+@app.route('/debug_streams', methods=['POST'])
+def debug_streams():
     data = request.get_json()
     url = data.get('url')
-    video_id = data.get('videoId')
-    
-    if not url and video_id:
-        url = f"https://www.youtube.com/watch?v={video_id}"
     
     if not url:
-        return jsonify({"error": "Missing 'url' or 'videoId' parameter"}), 400
-
-    if not is_valid_youtube_url(url):
-        return jsonify({"error": "Invalid YouTube URL"}), 400
+        return jsonify({"error": "Missing 'url' parameter"}), 400
     
     try:
-        yt = YouTube(url)
-        
-        progressive = list(set([
-            stream.resolution 
-            for stream in yt.streams.filter(progressive=True, file_extension='mp4')
-            if stream.resolution
-        ]))
-        
-        all_resolutions = list(set([
-            stream.resolution 
-            for stream in yt.streams.filter(file_extension='mp4')
-            if stream.resolution
-        ]))
-        
-        return jsonify({
-            "success": True,
-            "progressive": sorted(progressive, key=lambda x: int(x.replace('p', '')), reverse=True),
-            "all": sorted(all_resolutions, key=lambda x: int(x.replace('p', '')), reverse=True)
-        }), 200
-        
+        ydl_opts = {'quiet': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get('formats', [])
+            
+            streams = []
+            for f in formats:
+                streams.append({
+                    "format_id": f.get('format_id'),
+                    "ext": f.get('ext'),
+                    "resolution": f.get('resolution'),
+                    "height": f.get('height'),
+                    "vcodec": f.get('vcodec'),
+                    "acodec": f.get('acodec'),
+                    "filesize": f.get('filesize'),
+                })
+            
+            return jsonify({
+                "title": info.get('title'),
+                "formats_count": len(formats),
+                "streams": streams
+            })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
