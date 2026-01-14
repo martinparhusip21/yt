@@ -10,6 +10,16 @@ def is_valid_youtube_url(url):
     pattern = r"^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w-]+"
     return re.match(pattern, url) is not None
 
+# Di app.py, tambah logic untuk:
+cookies_content = os.environ.get('YOUTUBE_COOKIES', '')
+if cookies_content:
+    # Tulis ke temp file
+    with open('/tmp/cookies.txt', 'w') as f:
+        f.write(cookies_content)
+    # Pakai di yt-dlp
+    ydl_opts['cookiefile'] = '/tmp/cookies.txt'
+
+
 def extract_video_id(url):
     patterns = [
         r'(?:v=|/)([a-zA-Z0-9_-]{11})(?:[&?]|$)',
