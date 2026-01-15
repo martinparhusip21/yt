@@ -7,16 +7,35 @@ import tempfile
 app = Flask(__name__)
 CORS(app)
 
+import base64
+
 def get_cookies_file():
     """Create temporary cookies file from environment variable"""
+    cookies_path = '/tmp/youtube_cookies.txt'
+    
+    # Try Base64 encoded first (recommended)
+    cookies_b64 = os.environ.get('YOUTUBE_COOKIES_B64', '')
+    if cookies_b64:
+        try:
+            cookies_content = base64.b64decode(cookies_b64).decode('utf-8')
+            with open(cookies_path, 'w') as f:
+                f.write(cookies_content)
+            print(f"[Cookies] Loaded from B64, size: {len(cookies_content)} bytes")
+            return cookies_path
+        except Exception as e:
+            print(f"[Cookies] B64 decode failed: {e}")
+    
+    # Fallback to plain text
     cookies_content = os.environ.get('YOUTUBE_COOKIES', '')
     if cookies_content:
-        # Write cookies to temp file
-        cookies_path = '/tmp/youtube_cookies.txt'
         with open(cookies_path, 'w') as f:
             f.write(cookies_content)
+        print(f"[Cookies] Loaded from plain, size: {len(cookies_content)} bytes")
         return cookies_path
+    
+    print("[Cookies] No cookies configured")
     return None
+
 
 @app.route('/')
 def home():
